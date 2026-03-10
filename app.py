@@ -21,10 +21,10 @@ CURRENCIES = {
 
 # Defaults shown in the technology rows
 TECH_DEFAULTS = [
-    (4,   '4h LFP',    85),
-    (12,  '12h RFC',   75),
-    (100, '100h LDES', 40),
-    (24,  '24h',       70),
+    (4,   'LFP',       85),
+    (12,  'RFC Power', 75),
+    (100, 'Iron-Air',  40),
+    (24,  '',          70),
 ]
 
 # Preset period options (number of years, in order of preference)
