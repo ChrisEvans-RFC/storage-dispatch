@@ -1,0 +1,21 @@
+# Generated chart outputs
+*.html
+*.png
+*.json
+
+# Large combined data file (individual country CSVs are included)
+european_wholesale_electricity_price_data_hourly/all_countries.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
