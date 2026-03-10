@@ -9,7 +9,7 @@ import os
 import numpy as np
 import pandas as pd
 import streamlit as st
-from soc_lp_final import load_most_recent_year, build_chart
+from soc_lp_final import get_available_years, load_year_range, build_chart
 
 DATA_DIR = 'european_wholesale_electricity_price_data_hourly'
 
@@ -26,6 +26,15 @@ TECH_DEFAULTS = [
     (100, '100h LDES', 40),
     (24,  '24h',       70),
 ]
+
+# Preset period options (number of years, in order of preference)
+PRESET_NS = [1, 2, 3, 5, 10]
+
+
+@st.cache_data
+def cached_available_years(filepath):
+    return get_available_years(filepath)
+
 
 st.set_page_config(page_title='Storage Dispatch Optimiser', layout='wide')
 st.title('Storage Dispatch Optimiser')
@@ -49,6 +58,33 @@ with st.sidebar:
     ])
     default_idx = countries.index('United Kingdom') if 'United Kingdom' in countries else 0
     country = st.selectbox('Country', countries, index=default_idx)
+
+    # ── Analysis period ───────────────────────────────────────────────────────
+    st.divider()
+    filepath_sidebar = os.path.join(DATA_DIR, f'{country}.csv')
+    avail_years      = cached_available_years(filepath_sidebar)
+    n_avail          = len(avail_years)
+
+    period_options = []
+    for n in PRESET_NS:
+        if n <= n_avail:
+            yr_start = avail_years[-n]
+            yr_end   = avail_years[-1]
+            yr_range = str(yr_end) if n == 1 else f'{yr_start}–{yr_end}'
+            label    = 'Most recent year' if n == 1 else f'Last {n} years'
+            period_options.append((f'{label} ({yr_range})', avail_years[-n:]))
+
+    # Add "All available" if n_avail isn't already one of the presets
+    if n_avail > 0 and n_avail not in PRESET_NS:
+        yr_range = str(avail_years[0]) if n_avail == 1 else f'{avail_years[0]}–{avail_years[-1]}'
+        period_options.append(
+            (f'All available ({yr_range}, {n_avail} yrs)', avail_years)
+        )
+
+    period_labels  = [o[0] for o in period_options]
+    selected_label = st.selectbox('Analysis period', period_labels)
+    selected_years = next(o[1] for o in period_options if o[0] == selected_label)
+    n_years        = len(selected_years)
 
     # ── Currency ──────────────────────────────────────────────────────────────
     st.divider()
@@ -95,28 +131,37 @@ with st.sidebar:
 if run:
     filepath = os.path.join(DATA_DIR, f'{country}.csv')
 
-    with st.spinner(f'Loading {country} price data...'):
-        datetimes, prices, year = load_most_recent_year(
-            filepath, fx_rate=fx_rate, currency_symbol=currency_symbol
+    with st.spinner(f'Loading {country} price data ({selected_label})...'):
+        datetimes, prices, year_label, n_years = load_year_range(
+            filepath, selected_years, fx_rate=fx_rate, currency_symbol=currency_symbol
         )
 
+    ann_note = '' if n_years == 1 else f'  |  Metrics shown as annual averages over {n_years} years'
     st.info(
-        f'**{country} {year}** — {len(prices):,} hours loaded  |  '
+        f'**{country} {year_label}** — {len(prices):,} hours loaded  |  '
         f'Mean {currency_symbol}{prices.mean():.1f}/MWh  |  '
         f'Negative hours: {(prices < 0).mean()*100:.1f}%'
+        + ann_note
     )
 
-    with st.spinner('Running LP optimisation (this may take a few seconds)...'):
+    spinner_msg = ('Running LP optimisation — this covers '
+                   f'{len(prices):,} hours so may take up to a minute...'
+                   if n_years > 1 else
+                   'Running LP optimisation (this may take a few seconds)...')
+
+    with st.spinner(spinner_msg):
         fig, results = build_chart(
-            datetimes, prices, year,
+            datetimes, prices, year_label,
             country=country,
             tech_config=tech_config,
             currency_symbol=currency_symbol,
+            n_years=n_years,
         )
 
     st.plotly_chart(fig, use_container_width=True)
 
     # ── Summary table ─────────────────────────────────────────────────────────
+    ann = f' (avg/yr)' if n_years > 1 else '/yr'
     st.subheader('Performance summary')
 
     rows = []
@@ -133,36 +178,36 @@ if run:
         charge_cost      = float(np.dot(charge,    prices))
         discharge_rev    = float(np.dot(discharge, prices))
         net_revenue      = discharge_rev - charge_cost
-        cycles           = discharge_energy / duration if duration > 0 else 0.0
         avg_charge_price = charge_cost    / charge_energy    if charge_energy    > 0 else 0.0
         avg_disc_price   = discharge_rev  / discharge_energy if discharge_energy > 0 else 0.0
 
         rows.append({
-            'Technology':                          r['tech_name'],
-            'Duration (h)':                        duration,
-            'RTE (%)':                             int(r['rte'] * 100),
-            f'Net revenue ({currency_symbol}k/MW/yr)': round(net_revenue / 1000, 1),
-            f'Discharge revenue ({currency_symbol}k/MW/yr)': round(discharge_rev / 1000, 1),
-            f'Charge cost ({currency_symbol}k/MW/yr)':       round(charge_cost   / 1000, 1),
-            'Discharge hours/yr':                  int(np.sum(d_mask)),
-            'Charge hours/yr':                     int(np.sum(c_mask)),
-            'Discharge energy (MWh/yr)':           round(discharge_energy, 0),
-            'Charge energy (MWh/yr)':              round(charge_energy,    0),
-            'Cycles/yr':                           round(cycles, 1),
-            f'Avg discharge price ({currency_symbol}/MWh)': round(avg_disc_price,   1),
-            f'Avg charge price ({currency_symbol}/MWh)':    round(avg_charge_price, 1),
-            f'Price spread captured ({currency_symbol}/MWh)': round(avg_disc_price - avg_charge_price, 1),
+            'Technology':                                      r['tech_name'],
+            'Duration (h)':                                    duration,
+            'RTE (%)':                                         int(r['rte'] * 100),
+            f'Net revenue ({currency_symbol}k/MW{ann})':      round(net_revenue    / n_years / 1000, 1),
+            f'Discharge revenue ({currency_symbol}k/MW{ann})':round(discharge_rev  / n_years / 1000, 1),
+            f'Charge cost ({currency_symbol}k/MW{ann})':      round(charge_cost    / n_years / 1000, 1),
+            f'Discharge hours{ann}':                           round(np.sum(d_mask) / n_years, 0),
+            f'Charge hours{ann}':                              round(np.sum(c_mask) / n_years, 0),
+            f'Discharge energy (MWh{ann})':                   round(discharge_energy / n_years, 0),
+            f'Charge energy (MWh{ann})':                      round(charge_energy    / n_years, 0),
+            f'Cycles{ann}':                                    round(discharge_energy / n_years / duration, 1),
+            f'Avg discharge price ({currency_symbol}/MWh)':   round(avg_disc_price,   1),
+            f'Avg charge price ({currency_symbol}/MWh)':      round(avg_charge_price, 1),
+            f'Price spread ({currency_symbol}/MWh)':          round(avg_disc_price - avg_charge_price, 1),
         })
 
     df_summary = pd.DataFrame(rows).set_index('Technology')
     st.dataframe(df_summary, use_container_width=True)
 
     # ── Download ───────────────────────────────────────────────────────────────
+    safe_label = year_label.replace('–', '-')
     html_bytes = fig.to_html(include_plotlyjs='cdn').encode('utf-8')
     st.download_button(
         label='Download chart as HTML',
         data=html_bytes,
-        file_name=f'storage_dispatch_{country.replace(" ", "_")}_{year}.html',
+        file_name=f'storage_dispatch_{country.replace(" ", "_")}_{safe_label}.html',
         mime='text/html',
     )
 

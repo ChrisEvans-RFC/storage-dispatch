@@ -1,7 +1,7 @@
 """
 SOC Final Visualisation — LP Optimal Dispatch
 ==============================================
-Loads the most recent complete year of European day-ahead price data,
+Loads European day-ahead price data for a configurable year range,
 runs LP-optimal perfect-foresight dispatch for configurable storage durations,
 and produces a clean 2-panel interactive Plotly chart.
 
@@ -22,8 +22,8 @@ EUR_TO_GBP = 0.86
 
 # Default technology assignments used by the CLI entry point
 DURATION_TECH = {
-    4:   {'name': 'LFP',    'rte': 0.85},
-    12:  {'name': 'RFC',   'rte': 0.75},
+    4:   {'name': 'LFP',  'rte': 0.85},
+    12:  {'name': 'RFC',  'rte': 0.75},
     100: {'name': 'LDES', 'rte': 0.40},
 }
 
@@ -90,10 +90,23 @@ def lp_dispatch(prices, duration, rte=0.75, power_mw=1.0):
 # DATA
 # =============================================================================
 
-def load_most_recent_year(filepath, fx_rate=1.0, currency_symbol='EUR'):
+def get_available_years(filepath):
     """
-    Load the most recent complete year from a price CSV.
+    Return a sorted list of years with >= 8700 hours of data in the CSV.
+    Reads only the date column so it is fast enough to use for UI population.
+    """
+    df = pd.read_csv(filepath, usecols=['Datetime (UTC)'])
+    df['Datetime (UTC)'] = pd.to_datetime(df['Datetime (UTC)'])
+    year_counts = df.groupby(df['Datetime (UTC)'].dt.year).size()
+    return sorted(int(y) for y in year_counts[year_counts >= 8700].index)
+
+
+def load_year_range(filepath, years, fx_rate=1.0, currency_symbol='EUR'):
+    """
+    Load all hours for the given list of years from a price CSV.
     Prices are converted from EUR using fx_rate.
+
+    Returns: datetimes, prices, year_label (str), n_years (int)
     """
     df        = pd.read_csv(filepath)
     date_col  = 'Datetime (UTC)'
@@ -102,42 +115,51 @@ def load_most_recent_year(filepath, fx_rate=1.0, currency_symbol='EUR'):
     df[date_col] = pd.to_datetime(df[date_col])
     df = df.sort_values(date_col).reset_index(drop=True)
 
-    year_counts = df.groupby(df[date_col].dt.year).size()
-    target_year = int(year_counts[year_counts >= 8700].index.max())
-
-    df_year = df[df[date_col].dt.year == target_year].copy().reset_index(drop=True)
-    prices  = df_year[price_col].values.astype(float) * fx_rate
+    df_range = df[df[date_col].dt.year.isin(years)].copy().reset_index(drop=True)
+    prices   = df_range[price_col].values.astype(float) * fx_rate
 
     nan_mask = np.isnan(prices)
     if nan_mask.any():
         prices = np.interp(np.arange(len(prices)),
                            np.where(~nan_mask)[0], prices[~nan_mask])
 
-    print(f"Loaded {target_year}: {len(prices)} hours  "
+    n_years    = len(years)
+    year_label = str(years[0]) if n_years == 1 else f'{years[0]}–{years[-1]}'
+
+    print(f"Loaded {year_label}: {len(prices)} hours  "
           f"mean {currency_symbol}{prices.mean():.1f}/MWh  "
           f"std {prices.std():.1f}  "
           f"neg {(prices < 0).mean()*100:.1f}%")
-    return df_year[date_col].values, prices, target_year
+    return df_range[date_col].values, prices, year_label, n_years
+
+
+def load_most_recent_year(filepath, fx_rate=1.0, currency_symbol='EUR'):
+    """Convenience wrapper for the CLI: loads the most recent complete year."""
+    years = get_available_years(filepath)
+    datetimes, prices, year_label, _ = load_year_range(
+        filepath, [years[-1]], fx_rate, currency_symbol)
+    return datetimes, prices, year_label
 
 
 # =============================================================================
 # CHART
 # =============================================================================
 
-def build_chart(datetimes, prices, year, country='Unknown',
-                tech_config=None, currency_symbol='EUR', output=None):
+def build_chart(datetimes, prices, year_label, country='Unknown',
+                tech_config=None, currency_symbol='EUR', n_years=1, output=None):
     """
     Build and return a 2-panel Plotly figure.
 
-    tech_config : list of dicts, each with keys:
-                    'duration' (int, hours)
-                    'name'     (str, technology label)
-                    'rte'      (float, 0–1)
-                  Up to 4 entries. Defaults to DURATION_TECH values if None.
-    currency_symbol : displayed on axis labels and hover text (e.g. 'GBP', 'EUR').
-    output      : path to write an HTML file, or None to skip.
+    tech_config  : list of dicts, each with keys:
+                     'duration' (int, hours), 'name' (str), 'rte' (float, 0–1)
+                   Up to 4 entries. Defaults to DURATION_TECH values if None.
+    currency_symbol : displayed on axis labels and hover text.
+    n_years      : number of years in the analysis period, used to annualise
+                   revenue figures shown in the legend and print output.
+    output       : path to write an HTML file, or None to skip.
 
-    Returns the plotly Figure object.
+    Returns (fig, results) where results is a list of per-technology dicts
+    containing the raw LP arrays (charge, discharge, soc) and summary values.
     """
     if tech_config is None:
         tech_config = [{'duration': d, **v} for d, v in DURATION_TECH.items()]
@@ -151,7 +173,9 @@ def build_chart(datetimes, prices, year, country='Unknown',
         d, rte, tech_name = tc['duration'], tc['rte'], tc['name']
         print(f"  LP {d}h ({tech_name} {rte*100:.0f}% RTE)...", end=' ', flush=True)
         charge, discharge, soc, revenue = lp_dispatch(prices, d, rte=rte)
-        print(f"{ccy}{revenue/1000:.1f}k/MW/yr  ({int(np.sum(discharge > 1e-4))} discharge h)")
+        rev_ann = revenue / n_years
+        print(f"{ccy}{rev_ann/1000:.1f}k/MW/yr  "
+              f"({int(np.sum(discharge > 1e-4) / n_years)} discharge h/yr)")
 
         n_orig   = len(soc)
         n_fine   = (n_orig - 1) * interp_factor + 1
@@ -163,7 +187,8 @@ def build_chart(datetimes, prices, year, country='Unknown',
                             soc=soc, soc_fine=soc_fine, dt_fine=dt_fine,
                             revenue=revenue, tech_name=tech_name, rte=rte))
 
-    dur_label = ' / '.join(f'{r["duration"]}h' for r in results)
+    dur_label  = ' / '.join(f'{r["duration"]}h' for r in results)
+    yr_suffix  = '' if n_years == 1 else f' (avg over {n_years} years)'
 
     # ── subplot: 2 rows ───────────────────────────────────────────────────────
     fig = make_subplots(
@@ -172,7 +197,7 @@ def build_chart(datetimes, prices, year, country='Unknown',
         row_heights=[0.38, 0.62],
         vertical_spacing=0.06,
         subplot_titles=[
-            f'{country} Day-Ahead Electricity Price {year} ({ccy}/MWh)',
+            f'{country} Day-Ahead Electricity Price {year_label} ({ccy}/MWh)',
             f'State of Charge — {dur_label}, LP optimal',
         ]
     )
@@ -194,14 +219,14 @@ def build_chart(datetimes, prices, year, country='Unknown',
 
     for i, r in enumerate(results):
         colour, fill = PALETTE[i % len(PALETTE)]
-        rev_k = r['revenue'] / 1000
-        d     = r['duration']
+        rev_ann_k = r['revenue'] / n_years / 1000
+        d         = r['duration']
 
         fig.add_trace(
             go.Scatter(
                 x=r['dt_fine'], y=r['soc_fine'],
                 mode='lines',
-                name=f'{d}h {r["tech_name"]} SoC  ({ccy}{rev_k:.0f}k/MW/yr)',
+                name=f'{d}h {r["tech_name"]} SoC  ({ccy}{rev_ann_k:.0f}k/MW/yr{yr_suffix})',
                 line=dict(color=colour, width=1.6),
                 fill='tozeroy', fillcolor=fill,
                 hovertemplate=f'%{{x|%d %b %H:%M}}<br>{d}h SoC: %{{y:.2f}} h<extra></extra>',
@@ -220,7 +245,7 @@ def build_chart(datetimes, prices, year, country='Unknown',
     # ── layout ────────────────────────────────────────────────────────────────
     fig.update_layout(
         title=dict(
-            text=(f'Storage SoC — {country} {year} Day-Ahead Prices  '
+            text=(f'Storage SoC — {country} {year_label} Day-Ahead Prices  '
                   f'({dur_label}, LP optimal)'),
             font=dict(size=15),
         ),
@@ -271,10 +296,10 @@ if __name__ == '__main__':
     tech_config = [{'duration': d, **v} for d, v in DURATION_TECH.items()]
 
     print(f"Loading: {filepath}")
-    datetimes, prices, year = load_most_recent_year(
+    datetimes, prices, year_label = load_most_recent_year(
         filepath, fx_rate=EUR_TO_GBP, currency_symbol='GBP')
 
     print(f"\nRunning LP dispatch...")
-    fig, _ = build_chart(datetimes, prices, year, country=country,
+    fig, _ = build_chart(datetimes, prices, year_label, country=country,
                          tech_config=tech_config, currency_symbol='GBP',
-                         output='soc_lp_final.html')
+                         n_years=1, output='soc_lp_final.html')
