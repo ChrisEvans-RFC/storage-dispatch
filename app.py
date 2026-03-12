@@ -32,10 +32,10 @@ CURRENCIES = {
 PRESET_NS = [1, 2, 3, 5, 10]
 
 TECH_DEFAULTS = [
-    (4,   'LFP',       85),
-    (12,  'RFC Power', 75),
-    (100, 'Iron-Air',  40),
-    (24,  '',          70),
+    (4,   'LFP',       85,  600),
+    (12,  'RFC Power', 75, 1000),
+    (100, 'Iron-Air',  40, 1000),
+    (24,  '',          70,    0),
 ]
 
 TS_DURATIONS        = [2, 4, 8, 16, 32, 64, 128]
@@ -298,14 +298,18 @@ with st.sidebar:
                                    min_value=1, max_value=4, value=3, step=1)
     tech_config = []
     for i in range(n_techs):
-        d_def, name_def, rte_def = TECH_DEFAULTS[i]
+        d_def, name_def, rte_def, cyc_def = TECH_DEFAULTS[i]
         with st.expander(f'Technology {i + 1}', expanded=True):
-            duration = st.number_input('Duration (hours)', min_value=1, max_value=8760,
-                                       value=d_def, step=1, key=f'dur_{i}')
-            name     = st.text_input('Label', value=name_def, key=f'name_{i}')
-            rte_pct  = st.slider('Round-trip efficiency (%)', min_value=10, max_value=100,
+            c1, c2 = st.columns([3, 2])
+            name     = c1.text_input('Label', value=name_def, key=f'name_{i}')
+            duration = c2.number_input('Duration (h)', min_value=1, max_value=8760,
+                                        value=d_def, step=1, key=f'dur_{i}')
+            rte_pct  = st.slider('RTE (%)', min_value=10, max_value=100,
                                   value=rte_def, step=5, key=f'rte_{i}')
-            tech_config.append({'duration': int(duration), 'name': name, 'rte': rte_pct / 100})
+            max_cyc  = st.number_input('Max cycles/yr  (0 = unlimited)',
+                                        min_value=0, value=cyc_def, step=50, key=f'cyc_{i}')
+            tech_config.append({'duration': int(duration), 'name': name,
+                                 'rte': rte_pct / 100, 'max_cycles': int(max_cyc)})
 
     st.divider()
     run = st.button('Run analysis', type='primary', use_container_width=True)
@@ -317,7 +321,7 @@ with st.sidebar:
 
 _cache_key = (
     country, tuple(selected_years), fx_rate,
-    tuple((t['duration'], t['rte']) for t in tech_config),
+    tuple((t['duration'], t['rte'], t['max_cycles']) for t in tech_config),
     len(TS_DURATIONS), len(TS_EFFICIENCIES),
 )
 
@@ -364,6 +368,7 @@ if run:
         'cache_key':   _cache_key,
         'fig_soc':     fig_soc,
         'soc_results': soc_results,
+        'tech_config': tech_config,
         'prices':      prices,
         'year_label':  year_label,
         'n_yrs':       n_yrs,
@@ -384,6 +389,7 @@ if ('cache_key' in st.session_state
 
     fig_soc     = st.session_state['fig_soc']
     soc_results = st.session_state['soc_results']
+    tech_config = st.session_state['tech_config']
     prices      = st.session_state['prices']
     year_label  = st.session_state['year_label']
     n_yrs       = st.session_state['n_yrs']
@@ -398,7 +404,7 @@ if ('cache_key' in st.session_state
     ann = ' (avg/yr)' if n_yrs > 1 else '/yr'
     st.subheader('Performance summary')
     rows = []
-    for r in soc_results:
+    for r, tc in zip(soc_results, tech_config):
         charge    = r['charge']
         discharge = r['discharge']
         duration  = r['duration']
@@ -409,10 +415,13 @@ if ('cache_key' in st.session_state
         net_rev   = (dr - cc) / n_yrs
         avg_dp    = dr / de if de > 0 else 0.0
         avg_cp    = cc / ce if ce > 0 else 0.0
+        max_cyc   = tc['max_cycles']
+        cyc_cap   = str(max_cyc) if max_cyc > 0 else '—'
         rows.append({
             'Technology':                            r['tech_name'],
             'Duration (h)':                          duration,
             'RTE (%)':                               int(r['rte'] * 100),
+            'Max cycles/yr cap':                     cyc_cap,
             f'Net revenue ({ccy_sym}k/MW{ann})':    round(net_rev / 1000, 1),
             f'Discharge rev. ({ccy_sym}k/MW{ann})': round(dr / n_yrs / 1000, 1),
             f'Charge cost ({ccy_sym}k/MW{ann})':    round(cc / n_yrs / 1000, 1),

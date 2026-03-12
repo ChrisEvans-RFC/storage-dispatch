@@ -43,7 +43,7 @@ PALETTE = [
 # LP DISPATCH
 # =============================================================================
 
-def lp_dispatch(prices, duration, rte=0.75, power_mw=1.0):
+def lp_dispatch(prices, duration, rte=0.75, power_mw=1.0, max_cycles=0, n_years=1):
     """
     Optimal perfect-foresight dispatch via Linear Programme (HiGHS backend).
 
@@ -54,6 +54,7 @@ def lp_dispatch(prices, duration, rte=0.75, power_mw=1.0):
     Variables per hour t:  charge[t], discharge[t] in [0, power_mw]
                            soc[t+1] in [0, capacity]   (soc[0]=0 fixed)
     Equality:              soc[t+1] = soc[t] + charge[t]*rte - discharge[t]
+    Inequality (optional): sum(discharge) ≤ max_cycles * n_years * capacity
     Objective:             maximise sum(discharge*price - charge*price)
     """
     n        = len(prices)
@@ -73,7 +74,15 @@ def lp_dispatch(prices, duration, rte=0.75, power_mw=1.0):
 
     bounds = [(0, power_mw)] * n + [(0, power_mw)] * n + [(0, capacity)] * n
 
-    res = linprog(c_obj, A_eq=A_eq, b_eq=b_eq, bounds=bounds,
+    # Optional cycle cap: sum(discharge) ≤ max_cycles_per_year * n_years * capacity
+    A_ub, b_ub = None, None
+    if max_cycles > 0:
+        row = np.zeros((1, nv))
+        row[0, n:2*n] = 1.0
+        A_ub = row
+        b_ub = np.array([max_cycles * n_years * capacity])
+
+    res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds,
                   method='highs', options={'disp': False})
     if res.status != 0:
         raise RuntimeError(f"LP failed (status {res.status}): {res.message}")
@@ -171,8 +180,10 @@ def build_chart(datetimes, prices, year_label, country='Unknown',
 
     for tc in tech_config:
         d, rte, tech_name = tc['duration'], tc['rte'], tc['name']
+        max_cycles = tc.get('max_cycles', 0)
         print(f"  LP {d}h ({tech_name} {rte*100:.0f}% RTE)...", end=' ', flush=True)
-        charge, discharge, soc, revenue = lp_dispatch(prices, d, rte=rte)
+        charge, discharge, soc, revenue = lp_dispatch(prices, d, rte=rte,
+                                                       max_cycles=max_cycles, n_years=n_years)
         rev_ann = revenue / n_years
         print(f"{ccy}{rev_ann/1000:.1f}k/MW/yr  "
               f"({int(np.sum(discharge > 1e-4) / n_years)} discharge h/yr)")
