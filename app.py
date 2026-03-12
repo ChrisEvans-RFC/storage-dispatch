@@ -42,11 +42,8 @@ TS_DURATIONS        = [2, 4, 8, 16, 32, 64, 128]
 TS_EFFICIENCIES_PCT = list(range(30, 110, 10))
 TS_EFFICIENCIES     = [e / 100 for e in TS_EFFICIENCIES_PCT]
 
-TECH_MARKERS = [
-    {'name': 'LFP',       'duration':  4,  'rte': 0.85, 'symbol': 'square',  'color': '#2563eb'},
-    {'name': 'RFC Power', 'duration': 12,  'rte': 0.75, 'symbol': 'diamond', 'color': '#16a34a'},
-    {'name': 'Iron-Air',  'duration': 100, 'rte': 0.40, 'symbol': 'circle',  'color': '#dc2626'},
-]
+MARKER_SYMBOLS = ['square', 'diamond', 'circle', 'triangle-up']
+MARKER_COLORS  = ['#2563eb', '#16a34a', '#dc2626', '#7c3aed']
 
 METRIC_OPTIONS = [
     'Net revenue (k{ccy}/MW/yr)',
@@ -152,7 +149,7 @@ def _ts_axis(log_x):
     return x_vals, tick_vals, tick_text, title
 
 
-def build_contour(grids, metric_tmpl, ccy_sym, year_label, country, log_x=True):
+def build_contour(grids, metric_tmpl, ccy_sym, year_label, country, log_x=True, tech_markers=()):
     key    = _metric_key(metric_tmpl)
     z      = grids[key]
     label  = metric_tmpl.replace('{ccy}', ccy_sym)
@@ -170,7 +167,7 @@ def build_contour(grids, metric_tmpl, ccy_sym, year_label, country, log_x=True):
         hovertemplate='Duration: %{x}<br>Efficiency: %{y}%<br>' + label + ': %{z:.2f}<extra></extra>',
         name=label,
     ))
-    for tm in TECH_MARKERS:
+    for tm in tech_markers:
         x_mark  = np.log10(tm['duration']) if log_x else tm['duration']
         val_str = f'{_interp_grid(z, tm["duration"], tm["rte"]*100):.2f}'
         fig.add_trace(go.Scatter(
@@ -195,7 +192,7 @@ def build_contour(grids, metric_tmpl, ccy_sym, year_label, country, log_x=True):
     return fig
 
 
-def build_lines(grids, metric_tmpl, ccy_sym, year_label, country, log_x=True):
+def build_lines(grids, metric_tmpl, ccy_sym, year_label, country, log_x=True, tech_markers=()):
     key    = _metric_key(metric_tmpl)
     z      = grids[key]
     label  = metric_tmpl.replace('{ccy}', ccy_sym)
@@ -214,7 +211,7 @@ def build_lines(grids, metric_tmpl, ccy_sym, year_label, country, log_x=True):
         ))
 
     # Technology markers — interpolated values at exact (duration, rte) coordinates
-    for tm in TECH_MARKERS:
+    for tm in tech_markers:
         x_mark = np.log10(tm['duration']) if log_x else tm['duration']
         y_mark = _interp_grid(z, tm['duration'], tm['rte'] * 100)
         fig.add_trace(go.Scatter(
@@ -444,11 +441,19 @@ if ('cache_key' in st.session_state
         view  = st.radio('View', ['Contour', 'Lines'], horizontal=True)
         log_x = st.checkbox('Log x-axis', value=True)
 
+    tech_markers = [
+        {'name': tc['name'] or f'Tech {i+1}', 'duration': tc['duration'],
+         'rte': tc['rte'], 'symbol': MARKER_SYMBOLS[i], 'color': MARKER_COLORS[i]}
+        for i, tc in enumerate(tech_config)
+    ]
+
     selected_tmpl = METRIC_OPTIONS[metric_labels.index(selected_display)]
     if view == 'Contour':
-        fig_ts = build_contour(grids, selected_tmpl, ccy_sym, year_label, country, log_x)
+        fig_ts = build_contour(grids, selected_tmpl, ccy_sym, year_label, country, log_x,
+                               tech_markers=tech_markers)
     else:
-        fig_ts = build_lines(grids, selected_tmpl, ccy_sym, year_label, country, log_x)
+        fig_ts = build_lines(grids, selected_tmpl, ccy_sym, year_label, country, log_x,
+                             tech_markers=tech_markers)
     st.plotly_chart(fig_ts, use_container_width=True)
 
     # ── 4. Downloads ───────────────────────────────────────────────────────────
