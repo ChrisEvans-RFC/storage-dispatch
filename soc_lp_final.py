@@ -77,10 +77,11 @@ def lp_dispatch(prices, duration, rte=0.75, power_mw=1.0, max_cycles=0, n_years=
     # Optional cycle cap: sum(discharge) ≤ max_cycles_per_year * n_years * capacity
     A_ub, b_ub = None, None
     if max_cycles > 0:
-        row = np.zeros((1, nv))
-        row[0, n:2*n] = 1.0
-        A_ub = row
-        b_ub = np.array([max_cycles * n_years * capacity])
+        A_ub = csr_matrix(
+            (np.ones(n), (np.zeros(n, dtype=int), np.arange(n, 2 * n))),
+            shape=(1, nv),
+        )
+        b_ub = np.array([float(max_cycles * n_years * capacity)])
 
     res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds,
                   method='highs', options={'disp': False})
