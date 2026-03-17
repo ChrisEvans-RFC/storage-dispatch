@@ -120,7 +120,7 @@ def load_year_range(filepath, years, fx_rate=1.0, currency_symbol='EUR'):
     """
     df        = pd.read_csv(filepath)
     date_col  = 'Datetime (UTC)'
-    price_col = 'Price (EUR/MWhe)'
+    price_col = next((c for c in df.columns if c.lower().startswith('price')), 'Price (EUR/MWhe)')
 
     df[date_col] = pd.to_datetime(df[date_col])
     df = df.sort_values(date_col).reset_index(drop=True)

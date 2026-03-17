@@ -19,14 +19,24 @@ import streamlit as st
 
 from soc_lp_final import get_available_years, load_year_range, lp_dispatch, build_chart
 
-DATA_DIR = 'european_wholesale_electricity_price_data_hourly'
-
 # ── constants ──────────────────────────────────────────────────────────────────
 
+# Markets: display name → (data directory, base currency code, base currency symbol)
+DATA_SOURCES = {
+    'Europe (Day-Ahead)':    ('european_wholesale_electricity_price_data_hourly', 'EUR', '€'),
+    'ERCOT (Texas)':         ('ercot_wholesale_electricity_price_data_hourly',    'USD', '$'),
+    'CAISO (California)':    ('caiso_wholesale_electricity_price_data_hourly',    'USD', '$'),
+    'AEMO (Australia NEM)':  ('aemo_wholesale_electricity_price_data_hourly',     'AUD', 'A$'),
+}
+
+# EUR-relative exchange rates (1 EUR = X units); used to compute cross-rates
+EUR_FX = {'EUR': 1.00, 'GBP': 0.86, 'USD': 1.08, 'AUD': 1.75}
+
 CURRENCIES = {
-    'GBP (£)': ('GBP', '£', 0.86),
-    'EUR (€)': ('EUR', '€', 1.00),
-    'USD ($)': ('USD', '$', 1.08),
+    'EUR (€)':  ('EUR', '€'),
+    'GBP (£)':  ('GBP', '£'),
+    'USD ($)':  ('USD', '$'),
+    'AUD (A$)': ('AUD', 'A$'),
 }
 
 PRESET_NS = [1, 2, 3, 5, 10]
@@ -250,7 +260,7 @@ def build_lines(grids, metric_tmpl, ccy_sym, year_label, country, log_x=True, te
 st.set_page_config(page_title='Storage Dispatch Optimiser', layout='wide')
 st.title('Storage Dispatch Optimiser')
 st.caption(
-    'LP-optimal perfect-foresight dispatch on European day-ahead prices. '
+    'LP-optimal perfect-foresight dispatch on day-ahead / spot electricity prices. '
     '1 MW / N MWh system — no degradation or fixed costs.'
 )
 
@@ -259,10 +269,23 @@ st.caption(
 with st.sidebar:
     st.header('Settings')
 
+    # ── Market / region selection ──────────────────────────────────────────────
+    available_markets = [m for m, (d, _, _) in DATA_SOURCES.items() if os.path.isdir(d)]
+    if not available_markets:
+        st.error('No data directories found. Run download_data.py first.')
+        st.stop()
+
+    default_market = 'Europe (Day-Ahead)' if 'Europe (Day-Ahead)' in available_markets else available_markets[0]
+    market_label   = st.selectbox('Market', available_markets,
+                                  index=available_markets.index(default_market))
+    DATA_DIR, base_ccy, base_sym = DATA_SOURCES[market_label]
+
     countries   = sorted([os.path.splitext(f)[0] for f in os.listdir(DATA_DIR)
                           if f.endswith('.csv') and f != 'all_countries.csv'])
-    default_idx = countries.index('United Kingdom') if 'United Kingdom' in countries else 0
-    country     = st.selectbox('Country', countries, index=default_idx)
+    default_region = next((c for c in ('United Kingdom', 'ERCOT HB_NORTH', 'CAISO NP15',
+                                        'New South Wales') if c in countries), countries[0])
+    country     = st.selectbox('Region', countries,
+                               index=countries.index(default_region))
 
     st.divider()
     avail_yrs = cached_available_years(os.path.join(DATA_DIR, f'{country}.csv'))
@@ -283,11 +306,14 @@ with st.sidebar:
     n_years        = len(selected_years)
 
     st.divider()
-    ccy_label             = st.selectbox('Display currency', list(CURRENCIES.keys()))
-    ccy_code, ccy_sym, default_fx = CURRENCIES[ccy_label]
-    fx_rate = st.number_input(f'EUR → {ccy_code} exchange rate',
-                               value=float(default_fx), min_value=0.01,
-                               step=0.01, format='%.4f')
+    ccy_label            = st.selectbox('Display currency', list(CURRENCIES.keys()),
+                                        index=list(CURRENCIES.keys()).index(
+                                            next(k for k, (c, _) in CURRENCIES.items() if c == base_ccy)))
+    ccy_code, ccy_sym    = CURRENCIES[ccy_label]
+    default_fx           = round(EUR_FX[ccy_code] / EUR_FX[base_ccy], 4)
+    fx_rate              = st.number_input(f'{base_ccy} → {ccy_code} rate',
+                                           value=float(default_fx), min_value=0.0001,
+                                           step=0.01, format='%.4f')
 
     st.divider()
     st.subheader('Storage technologies')
@@ -317,7 +343,7 @@ with st.sidebar:
 # ── cache key ─────────────────────────────────────────────────────────────────
 
 _cache_key = (
-    country, tuple(selected_years), fx_rate,
+    market_label, country, tuple(selected_years), fx_rate,
     tuple((t['duration'], t['rte'], t['max_cycles']) for t in tech_config),
     len(TS_DURATIONS), len(TS_EFFICIENCIES),
 )

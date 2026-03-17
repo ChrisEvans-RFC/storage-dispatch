@@ -3,3 +3,8 @@ numpy
 pandas
 scipy
 plotly
+
+# Optional — only needed to run download_data.py:
+# gridstatus   # ERCOT and CAISO historical prices
+# nemosis      # AEMO Australia historical prices
+# pyarrow      # required by nemosis
