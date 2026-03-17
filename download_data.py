@@ -4,9 +4,9 @@ download_data.py
 ================
 Download hourly day-ahead / spot electricity prices for:
 
-  • CAISO  (California NP15/SP15)  → caiso_wholesale_electricity_price_data_hourly/
-  • ERCOT  (Texas hubs)            → ercot_wholesale_electricity_price_data_hourly/
-  • AEMO   (Australia NEM regions) → aemo_wholesale_electricity_price_data_hourly/
+  - CAISO  (California NP15/SP15)  -> caiso_wholesale_electricity_price_data_hourly/
+  - ERCOT  (Texas hubs)            -> ercot_wholesale_electricity_price_data_hourly/
+  - AEMO   (Australia NEM regions) -> aemo_wholesale_electricity_price_data_hourly/
 
 CSV format matches the European dataset:
   Country, ISO3 Code, Datetime (UTC), Datetime (Local), Price (<ccy>/MWh)
@@ -16,7 +16,7 @@ Requirements:
   (CAISO and ERCOT use only requests + pandas, already in requirements.txt)
 
 Usage:
-  python download_data.py                           # all markets, 2019–2024
+  python download_data.py                           # all markets, 2019-2024
   python download_data.py --market caiso
   python download_data.py --market aemo --start 2020 --end 2023
   python download_data.py --market ercot --start 2022 --end 2024
@@ -47,11 +47,21 @@ def _month_ranges(start_year: int, end_year: int):
         d = next_d
 
 
+def _biweekly_ranges(start_year: int, end_year: int):
+    """Yield (start_date, end_date) pairs in 14-day chunks."""
+    d = date(start_year, 1, 1)
+    end = date(end_year + 1, 1, 1)
+    while d < end:
+        next_d = min(d + timedelta(days=14), end)
+        yield d, next_d
+        d = next_d
+
+
 def _save(df: pd.DataFrame, out_dir: str, filename: str):
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, filename)
     df.to_csv(out_path, index=False)
-    print(f'  → Saved {len(df):,} rows to {out_path}')
+    print(f'  -> Saved {len(df):,} rows to {out_path}')
 
 
 # ── CAISO (OASIS API — no auth required) ─────────────────────────────────────
@@ -68,42 +78,51 @@ CAISO_URL = 'https://oasis.caiso.com/oasisapi/SingleZip'
 
 def _caiso_fetch_month(node_id: str, start: date, end: date,
                        session: requests.Session) -> pd.DataFrame | None:
+    # CAISO operating day starts at Pacific midnight = T08:00 UTC (PST) / T07:00 UTC (PDT).
+    # Using T07:00 covers both; duplicate hours at DST boundaries are dropped later.
+    # Note: OASIS API retains ~2 years of history; older months return "No data".
     params = {
         'queryname':     'PRC_LMP',
         'market_run_id': 'DAM',
         'node':          node_id,
-        'startdatetime': start.strftime('%Y%m%dT00:00-0000'),
-        'enddatetime':   end.strftime('%Y%m%dT00:00-0000'),
+        'startdatetime': start.strftime('%Y%m%dT07:00-0000'),
+        'enddatetime':   end.strftime('%Y%m%dT07:00-0000'),
         'version':       '1',
         'resultformat':  '6',   # CSV inside a ZIP
     }
-    for attempt in range(3):
+    for attempt in range(4):
         try:
             r = session.get(CAISO_URL, params=params, timeout=120)
             r.raise_for_status()
-            break
+            # Parse the ZIP — may fail on rate-limit responses (not valid ZIP)
+            with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+                csv_name = next((n for n in zf.namelist() if n.endswith('.csv')), None)
+                if csv_name is None:
+                    # XML response — check for "no data" vs real error
+                    xml_name = next((n for n in zf.namelist() if n.endswith('.xml')), None)
+                    if xml_name:
+                        txt = zf.read(xml_name).decode('utf-8', errors='replace')
+                        if 'No data returned' in txt or 'ERR_CODE' in txt:
+                            return None   # silently skip — outside retention window
+                        print(f'    WARN: unexpected XML for {start}: {txt[:200]}')
+                    return None
+                df = pd.read_csv(zf.open(csv_name), low_memory=False)
+                df = df[(df['LMP_TYPE'] == 'LMP') & (df['NODE'] == node_id)].copy()
+                if df.empty:
+                    return None
+                df['Datetime (UTC)'] = pd.to_datetime(df['INTERVALSTARTTIME_GMT'], utc=True).dt.tz_localize(None)
+                df = df[['Datetime (UTC)', 'MW']].rename(columns={'MW': 'Price (USD/MWh)'})
+                return df   # success
+        except (zipfile.BadZipFile, requests.HTTPError) as exc:
+            # Rate-limited (429) or transient bad response — back off and retry
+            wait = 20 * (attempt + 1)
+            print(f'    rate-limited, retrying in {wait}s...', end=' ', flush=True)
+            time.sleep(wait)
         except Exception as exc:
-            if attempt == 2:
-                print(f'    WARN: {exc}')
-                return None
-            time.sleep(5 * (attempt + 1))
-
-    try:
-        with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
-            csv_name = next(n for n in zf.namelist() if n.endswith('.csv'))
-            df = pd.read_csv(zf.open(csv_name), low_memory=False)
-    except Exception as exc:
-        print(f'    WARN: could not parse ZIP for {start}: {exc}')
-        return None
-
-    # Keep only LMP values for the requested node
-    df = df[(df['LMP_TYPE'] == 'LMP') & (df['NODE'] == node_id)].copy()
-    if df.empty:
-        return None
-
-    df['Datetime (UTC)'] = pd.to_datetime(df['INTERVALSTARTTIME_GMT'], utc=True).dt.tz_localize(None)
-    df = df[['Datetime (UTC)', 'MW']].rename(columns={'MW': 'Price (USD/MWh)'})
-    return df
+            print(f'    WARN: {start}: {exc}')
+            return None
+    print(f'    WARN: giving up on {start} after retries')
+    return None
 
 
 def download_caiso(start_year: int, end_year: int, out_dir: str):
@@ -113,18 +132,20 @@ def download_caiso(start_year: int, end_year: int, out_dir: str):
     for display_name, node_id in CAISO_NODES.items():
         print(f'\n  {display_name} ({node_id})')
         chunks = []
-        for start, end in _month_ranges(start_year, end_year):
-            print(f'    {start:%Y-%m}…', end=' ', flush=True)
+        current_year = None
+        for start, end in _biweekly_ranges(start_year, end_year):
+            if start.year != current_year:
+                current_year = start.year
+                print(f'    {current_year}:', end=' ', flush=True)
             chunk = _caiso_fetch_month(node_id, start, end, session)
             if chunk is not None and not chunk.empty:
                 chunks.append(chunk)
-                print(f'{len(chunk):,} rows')
-            else:
-                print('no data')
-            time.sleep(1)   # be polite to OASIS
+                print('.', end='', flush=True)
+            time.sleep(3)   # be polite to OASIS — rate limits at ~20 req/min
+        print()
 
         if not chunks:
-            print(f'  → No data collected for {display_name}')
+            print(f'  -> No data collected for {display_name}')
             continue
 
         result = (pd.concat(chunks)
@@ -136,6 +157,7 @@ def download_caiso(start_year: int, end_year: int, out_dir: str):
         result['Datetime (Local)'] = result['Datetime (UTC)'] - pd.Timedelta(hours=8)
         _save(result[['Country', 'ISO3 Code', 'Datetime (UTC)',
                        'Datetime (Local)', 'Price (USD/MWh)']], out_dir, f'{display_name}.csv')
+        time.sleep(30)  # pause between nodes to avoid rate-limiting
 
 
 # ── ERCOT (public REST API — no auth required for public reports) ─────────────
@@ -205,7 +227,7 @@ def download_ercot(start_year: int, end_year: int, out_dir: str):
         print(f'\n  {display_name}')
         chunks = []
         for start, end in _month_ranges(start_year, end_year):
-            print(f'    {start:%Y-%m}…', end=' ', flush=True)
+            print(f'    {start:%Y-%m}...', end=' ', flush=True)
             chunk = _ercot_fetch_month(hub, start, end, session)
             if chunk is not None and not chunk.empty:
                 chunks.append(chunk)
@@ -215,7 +237,7 @@ def download_ercot(start_year: int, end_year: int, out_dir: str):
             time.sleep(0.5)
 
         if not chunks:
-            print(f'  → No data collected for {display_name}')
+            print(f'  -> No data collected for {display_name}')
             continue
 
         result = (pd.concat(chunks)
@@ -249,7 +271,7 @@ def download_aemo(start_year: int, end_year: int, out_dir: str):
     os.makedirs(cache_dir,  exist_ok=True)
 
     for region_name, region_id in AEMO_REGIONS.items():
-        print(f'\n  AEMO {region_name} ({region_id}) {start_year}–{end_year}…')
+        print(f'\n  AEMO {region_name} ({region_id}) {start_year}-{end_year}...')
         try:
             df = dynamic_data_compiler(
                 start_time=f'{start_year}/01/01 00:05:00',
@@ -264,7 +286,7 @@ def download_aemo(start_year: int, end_year: int, out_dir: str):
             df['SETTLEMENTDATE'] = pd.to_datetime(df['SETTLEMENTDATE'])
             df['Datetime (UTC)'] = df['SETTLEMENTDATE'] - pd.Timedelta(hours=10)
 
-            # Resample 5-min dispatch intervals → hourly mean
+            # Resample 5-min dispatch intervals -> hourly mean
             df = (df.set_index('Datetime (UTC)')[['RRP']]
                     .sort_index()['RRP']
                     .resample('h').mean()
@@ -298,15 +320,15 @@ def main():
     args = parser.parse_args()
 
     if args.market in ('all', 'caiso'):
-        print(f'\nDownloading CAISO data {args.start}–{args.end}…')
+        print(f'\nDownloading CAISO data {args.start}-{args.end}...')
         download_caiso(args.start, args.end, 'caiso_wholesale_electricity_price_data_hourly')
 
     if args.market in ('all', 'ercot'):
-        print(f'\nDownloading ERCOT data {args.start}–{args.end}…')
+        print(f'\nDownloading ERCOT data {args.start}-{args.end}...')
         download_ercot(args.start, args.end, 'ercot_wholesale_electricity_price_data_hourly')
 
     if args.market in ('all', 'aemo'):
-        print(f'\nDownloading AEMO data {args.start}–{args.end}…')
+        print(f'\nDownloading AEMO data {args.start}-{args.end}...')
         download_aemo(args.start, args.end, 'aemo_wholesale_electricity_price_data_hourly')
 
     print('\nDone!')
