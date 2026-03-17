@@ -277,7 +277,7 @@ def download_aemo(start_year: int, end_year: int, out_dir: str):
                 start_time=f'{start_year}/01/01 00:05:00',
                 end_time=f'{end_year + 1}/01/01 00:00:00',
                 table_name='DISPATCHPRICE',
-                raw_data_cache=cache_dir,
+                raw_data_location=cache_dir,
                 filter_cols=['REGIONID'],
                 filter_values=[[region_id]],
                 keep_csv=False,
