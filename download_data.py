@@ -68,55 +68,53 @@ def _save(df: pd.DataFrame, out_dir: str, filename: str):
 #
 # API docs: https://www.caiso.com/documents/oasisapispecification.pdf
 # Returns a ZIP containing a CSV with hourly DAM LMPs.
+# NOTE: OASIS retains ~2 years of history. Data before ~2023 returns "No data".
 
 CAISO_NODES = {
     'CAISO NP15': 'TH_NP15_GEN-APND',
     'CAISO SP15': 'TH_SP15_GEN-APND',
 }
 CAISO_URL = 'https://oasis.caiso.com/oasisapi/SingleZip'
+CAISO_EARLIEST_YEAR = 2023  # OASIS only retains ~2 years; skip older requests
 
 
-def _caiso_fetch_month(node_id: str, start: date, end: date,
+def _caiso_fetch_chunk(node_id: str, start: date, end: date,
                        session: requests.Session) -> pd.DataFrame | None:
-    # CAISO operating day starts at Pacific midnight = T08:00 UTC (PST) / T07:00 UTC (PDT).
-    # Using T07:00 covers both; duplicate hours at DST boundaries are dropped later.
-    # Note: OASIS API retains ~2 years of history; older months return "No data".
+    # CAISO operating day starts at Pacific midnight = T08:00 UTC (PST).
+    # Using T08:00 is safe for year-level chunks; DST duplicates dropped later.
     params = {
         'queryname':     'PRC_LMP',
         'market_run_id': 'DAM',
         'node':          node_id,
-        'startdatetime': start.strftime('%Y%m%dT07:00-0000'),
-        'enddatetime':   end.strftime('%Y%m%dT07:00-0000'),
+        'startdatetime': start.strftime('%Y%m%dT08:00-0000'),
+        'enddatetime':   end.strftime('%Y%m%dT08:00-0000'),
         'version':       '1',
         'resultformat':  '6',   # CSV inside a ZIP
     }
-    for attempt in range(4):
+    for attempt in range(5):
         try:
             r = session.get(CAISO_URL, params=params, timeout=120)
             r.raise_for_status()
-            # Parse the ZIP — may fail on rate-limit responses (not valid ZIP)
             with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
                 csv_name = next((n for n in zf.namelist() if n.endswith('.csv')), None)
                 if csv_name is None:
-                    # XML response — check for "no data" vs real error
                     xml_name = next((n for n in zf.namelist() if n.endswith('.xml')), None)
                     if xml_name:
                         txt = zf.read(xml_name).decode('utf-8', errors='replace')
                         if 'No data returned' in txt or 'ERR_CODE' in txt:
-                            return None   # silently skip — outside retention window
+                            return None   # outside retention window
                         print(f'    WARN: unexpected XML for {start}: {txt[:200]}')
                     return None
                 df = pd.read_csv(zf.open(csv_name), low_memory=False)
                 df = df[(df['LMP_TYPE'] == 'LMP') & (df['NODE'] == node_id)].copy()
                 if df.empty:
                     return None
-                df['Datetime (UTC)'] = pd.to_datetime(df['INTERVALSTARTTIME_GMT'], utc=True).dt.tz_localize(None)
-                df = df[['Datetime (UTC)', 'MW']].rename(columns={'MW': 'Price (USD/MWh)'})
-                return df   # success
-        except (zipfile.BadZipFile, requests.HTTPError) as exc:
-            # Rate-limited (429) or transient bad response — back off and retry
-            wait = 20 * (attempt + 1)
-            print(f'    rate-limited, retrying in {wait}s...', end=' ', flush=True)
+                df['Datetime (UTC)'] = pd.to_datetime(
+                    df['INTERVALSTARTTIME_GMT'], utc=True).dt.tz_localize(None)
+                return df[['Datetime (UTC)', 'MW']].rename(columns={'MW': 'Price (USD/MWh)'})
+        except (zipfile.BadZipFile, requests.HTTPError):
+            wait = 30 * (attempt + 1)
+            print(f'\n    rate-limited, waiting {wait}s...', end=' ', flush=True)
             time.sleep(wait)
         except Exception as exc:
             print(f'    WARN: {start}: {exc}')
@@ -126,6 +124,14 @@ def _caiso_fetch_month(node_id: str, start: date, end: date,
 
 
 def download_caiso(start_year: int, end_year: int, out_dir: str):
+    effective_start = max(start_year, CAISO_EARLIEST_YEAR)
+    if effective_start > end_year:
+        print(f'  CAISO OASIS only retains data from {CAISO_EARLIEST_YEAR}; nothing to download.')
+        return
+    if start_year < CAISO_EARLIEST_YEAR:
+        print(f'  NOTE: CAISO OASIS retains ~2 years of data. '
+              f'Skipping {start_year}-{CAISO_EARLIEST_YEAR-1}, downloading {effective_start}-{end_year}.')
+
     session = requests.Session()
     session.headers['User-Agent'] = 'Mozilla/5.0 (storage-dispatch-tool)'
 
@@ -133,15 +139,15 @@ def download_caiso(start_year: int, end_year: int, out_dir: str):
         print(f'\n  {display_name} ({node_id})')
         chunks = []
         current_year = None
-        for start, end in _biweekly_ranges(start_year, end_year):
+        for start, end in _biweekly_ranges(effective_start, end_year):
             if start.year != current_year:
                 current_year = start.year
                 print(f'    {current_year}:', end=' ', flush=True)
-            chunk = _caiso_fetch_month(node_id, start, end, session)
+            chunk = _caiso_fetch_chunk(node_id, start, end, session)
             if chunk is not None and not chunk.empty:
                 chunks.append(chunk)
                 print('.', end='', flush=True)
-            time.sleep(3)   # be polite to OASIS — rate limits at ~20 req/min
+            time.sleep(8)   # ~7 req/min — well within OASIS rate limit
         print()
 
         if not chunks:
@@ -157,90 +163,124 @@ def download_caiso(start_year: int, end_year: int, out_dir: str):
         result['Datetime (Local)'] = result['Datetime (UTC)'] - pd.Timedelta(hours=8)
         _save(result[['Country', 'ISO3 Code', 'Datetime (UTC)',
                        'Datetime (Local)', 'Price (USD/MWh)']], out_dir, f'{display_name}.csv')
-        time.sleep(30)  # pause between nodes to avoid rate-limiting
+        time.sleep(60)  # pause between nodes
 
 
-# ── ERCOT (public REST API — no auth required for public reports) ─────────────
+# ── ERCOT (public historical archive — no auth required) ─────────────────────
 #
-# ERCOT public API: https://api.ercot.com/api/public-reports
-# Report NP4-190-CD: DAM Settlement Point Prices (Load Zones & Hubs)
+# ERCOT publishes yearly zipped CSVs of DAM Settlement Point Prices (NP4-190-CD)
+# at their public CDR archive. Each file covers one calendar year.
+# URL: https://www.ercot.com/files/docs/YYYY/NP4-190-CDYYYYMMDDYYYYMMDD.zip
+# Fallback: try the "Historical DAM Settlement Point Prices" bulk file.
 
 ERCOT_HUBS = ['HB_NORTH', 'HB_SOUTH', 'HB_WEST', 'HB_HOUSTON']
-ERCOT_BASE = 'https://api.ercot.com/api/public-reports/np4-190-cd'
 
 
-def _ercot_fetch_month(hub: str, start: date, end: date,
-                       session: requests.Session) -> pd.DataFrame | None:
-    """Fetch one month of ERCOT DAM SPP for a single hub via the public API."""
-    url = f'{ERCOT_BASE}/lz_and_hub_da_spp'
-    params = {
-        'deliveryDateFrom': start.strftime('%Y-%m-%d'),
-        'deliveryDateTo':   (end - timedelta(days=1)).strftime('%Y-%m-%d'),
-        'settlementPoint':  hub,
-        'size':             10000,
-        'page':             1,
-    }
-    rows = []
-    while True:
-        for attempt in range(3):
-            try:
-                r = session.get(url, params=params, timeout=60)
-                r.raise_for_status()
-                break
-            except Exception as exc:
-                if attempt == 2:
-                    print(f'    WARN: {exc}')
-                    return pd.DataFrame(rows) if rows else None
-                time.sleep(5)
+def _ercot_year_urls(year: int):
+    """Return candidate URLs for ERCOT DAM SPP annual archive files."""
+    y = str(year)
+    return [
+        f'https://www.ercot.com/files/docs/{y}/NP4-190-CD_{y}0101_{y}1231.zip',
+        f'https://www.ercot.com/files/docs/{y}/Historical_DAM_Load_Zone_and_Hub_Prices.zip',
+        f'https://www.ercot.com/files/docs/{y}/Historical_DAM_Settlement_Point_Prices.zip',
+        f'https://www.ercot.com/files/docs/{y}/da_spp_{y}.zip',
+    ]
 
-        data = r.json()
-        page_rows = data.get('data', [])
-        rows.extend(page_rows)
 
-        meta = data.get('_meta', {})
-        if params['page'] >= meta.get('totalPages', 1):
-            break
-        params['page'] += 1
-
-    if not rows:
-        return None
-
-    df = pd.DataFrame(rows)
-    # Expected columns: deliveryDate, hourEnding, settlementPoint, settlementPointPrice
-    df['hour'] = df['hourEnding'].astype(str).str.zfill(2)
-    df['Datetime (Local)'] = pd.to_datetime(
-        df['deliveryDate'].astype(str) + ' ' + (df['hourEnding'].astype(int) - 1).astype(str).str.zfill(2) + ':00',
-        format='%Y-%m-%d %H:%M'
-    )
-    df['Datetime (UTC)']   = df['Datetime (Local)'] + pd.Timedelta(hours=6)  # CST = UTC-6
-    df = df[['Datetime (UTC)', 'Datetime (Local)', 'settlementPointPrice']].copy()
-    df.columns = ['Datetime (UTC)', 'Datetime (Local)', 'Price (USD/MWh)']
-    return df
+def _ercot_fetch_year(year: int, session: requests.Session) -> pd.DataFrame | None:
+    """Try each candidate URL for a year; return raw DataFrame if found."""
+    for url in _ercot_year_urls(year):
+        try:
+            r = session.get(url, timeout=120)
+            if r.status_code == 404:
+                continue
+            r.raise_for_status()
+            with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+                csv_name = next((n for n in zf.namelist()
+                                 if n.endswith('.csv') and not n.startswith('__')), None)
+                if csv_name is None:
+                    continue
+                df = pd.read_csv(zf.open(csv_name), low_memory=False)
+                print(f'      fetched from {url.split("/")[-1]}', flush=True)
+                return df
+        except (zipfile.BadZipFile, requests.HTTPError, Exception):
+            continue
+    return None
 
 
 def download_ercot(start_year: int, end_year: int, out_dir: str):
+    """
+    Download ERCOT historical DAM Settlement Point Prices from their public archive.
+
+    If this returns no data (ERCOT periodically restructures their archive URLs),
+    register for a free API key at https://developer.ercot.com and re-run with
+    the --ercot-key argument (to be implemented).
+    """
     session = requests.Session()
-    session.headers['User-Agent'] = 'Mozilla/5.0 (storage-dispatch-tool)'
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/zip, application/octet-stream, */*',
+        'Referer': 'https://www.ercot.com/',
+    })
 
-    for hub in ERCOT_HUBS:
-        display_name = f'ERCOT {hub}'
-        print(f'\n  {display_name}')
-        chunks = []
-        for start, end in _month_ranges(start_year, end_year):
-            print(f'    {start:%Y-%m}...', end=' ', flush=True)
-            chunk = _ercot_fetch_month(hub, start, end, session)
-            if chunk is not None and not chunk.empty:
-                chunks.append(chunk)
-                print(f'{len(chunk):,} rows')
-            else:
-                print('no data')
-            time.sleep(0.5)
+    # Collect all years into per-hub DataFrames
+    hub_chunks: dict[str, list] = {h: [] for h in ERCOT_HUBS}
 
-        if not chunks:
-            print(f'  -> No data collected for {display_name}')
+    for year in range(start_year, end_year + 1):
+        print(f'    {year}...', end=' ', flush=True)
+        df = _ercot_fetch_year(year, session)
+        if df is None:
+            print('no data (URL not found)')
             continue
 
-        result = (pd.concat(chunks)
+        # Normalise column names (ERCOT changes them between years)
+        df.columns = [c.strip().upper() for c in df.columns]
+
+        # Find the key columns by common name variants
+        col_map = {}
+        for col in df.columns:
+            cl = col.lower()
+            if 'settlement' in cl and 'point' in cl and 'price' in cl and 'type' not in cl:
+                col_map['price'] = col
+            elif 'delivery' in cl and 'date' in cl:
+                col_map['date'] = col
+            elif 'hour' in cl and 'end' in cl:
+                col_map['hour'] = col
+            elif col in ('SETTLEMENTPOINT', 'SETTLEMENT_POINT', 'SETTLEMENT POINT'):
+                col_map['node'] = col
+
+        if not all(k in col_map for k in ('price', 'date', 'hour', 'node')):
+            print(f'WARN: unrecognised columns: {list(df.columns)[:10]}')
+            continue
+
+        # Build datetime: hourEnding is 1-24, so subtract 1 for 0-based hour
+        df['Datetime (Local)'] = pd.to_datetime(
+            df[col_map['date']].astype(str) + ' ' +
+            (df[col_map['hour']].astype(float).astype(int) - 1).astype(str).str.zfill(2) + ':00',
+            format='%Y-%m-%d %H:%M', errors='coerce'
+        )
+        df['Datetime (UTC)'] = df['Datetime (Local)'] + pd.Timedelta(hours=6)  # CST
+
+        for hub in ERCOT_HUBS:
+            mask = df[col_map['node']].astype(str).str.strip() == hub
+            sub = df[mask][['Datetime (UTC)', 'Datetime (Local)', col_map['price']]].copy()
+            sub.columns = ['Datetime (UTC)', 'Datetime (Local)', 'Price (USD/MWh)']
+            if not sub.empty:
+                hub_chunks[hub].append(sub)
+
+        rows_found = sum(len(df[df[col_map['node']].astype(str).str.strip() == h])
+                         for h in ERCOT_HUBS)
+        print(f'{rows_found:,} rows')
+        time.sleep(2)
+
+    os.makedirs(out_dir, exist_ok=True)
+    for hub in ERCOT_HUBS:
+        display_name = f'ERCOT {hub}'
+        if not hub_chunks[hub]:
+            print(f'  -> No data collected for {display_name}')
+            continue
+        result = (pd.concat(hub_chunks[hub])
+                    .dropna(subset=['Datetime (UTC)'])
                     .sort_values('Datetime (UTC)')
                     .drop_duplicates('Datetime (UTC)')
                     .reset_index(drop=True))
