@@ -101,7 +101,8 @@ def _run_dispatch(prices_bytes: bytes, dur: int, rte_milli: int) -> dict:
     return _dispatch_one(prices, dur, rte_milli / 1000)
 
 
-def _assemble_grids(raw: dict, n_years: int, n_hours: int) -> dict:
+def _assemble_grids(raw: dict, n_years: int, n_hours: int,
+                    cm_payment: float = 0.0, cm_derate: int = 10) -> dict:
     n_eff = len(TS_EFFICIENCIES)
     n_dur = len(TS_DURATIONS)
     grids = {k: np.zeros((n_eff, n_dur)) for k in [
@@ -113,7 +114,8 @@ def _assemble_grids(raw: dict, n_years: int, n_hours: int) -> dict:
         ce  = r['charge_energy']
         cap = float(TS_DURATIONS[j])
         dh  = r['discharge_hours']
-        grids['net_revenue'][i, j]         = r['net_revenue']          / n_years / 1e3
+        cm_rev = cm_payment * min(1.0, float(TS_DURATIONS[j]) / cm_derate) if cm_payment > 0 else 0.0
+        grids['net_revenue'][i, j]         = r['net_revenue'] / n_years / 1e3 + cm_rev
         grids['cycles'][i, j]              = (de / n_years / cap)      if cap > 0 else 0.0
         grids['avg_discharge_price'][i, j] = (r['discharge_rev'] / de) if de  > 0 else 0.0
         grids['avg_charge_price'][i, j]    = (r['charge_cost']    / ce) if ce  > 0 else 0.0
@@ -316,6 +318,16 @@ with st.sidebar:
                                            step=0.01, format='%.4f')
 
     st.divider()
+    st.subheader('Capacity market')
+    cm_col1, cm_col2 = st.columns(2)
+    cm_payment = cm_col1.number_input(
+        f'Payment ({ccy_sym}/kW/yr)', min_value=0.0, value=0.0, step=1.0,
+        help='Annual capacity market payment at full de-rating. 0 = disabled.')
+    cm_derate  = cm_col2.number_input(
+        'De-rate below (h)', min_value=1, value=10, step=1,
+        help='Duration threshold below which payment is linearly de-rated.')
+
+    st.divider()
     st.subheader('Storage technologies')
     n_techs     = st.number_input('Number of technologies (max 4)',
                                    min_value=1, max_value=4, value=3, step=1)
@@ -346,6 +358,7 @@ _cache_key = (
     market_label, country, tuple(selected_years), fx_rate,
     tuple((t['duration'], t['rte'], t['max_cycles']) for t in tech_config),
     len(TS_DURATIONS), len(TS_EFFICIENCIES),
+    cm_payment, cm_derate,
 )
 
 # ── compute ───────────────────────────────────────────────────────────────────
@@ -383,7 +396,7 @@ if run:
             pct = 20 + int(78 * (k + 1) / n_grid)
             progress.progress(pct, text=f'Sensitivity: {k+1}/{n_grid} LP runs complete…')
 
-    grids = _assemble_grids(raw, n_yrs, len(prices))
+    grids = _assemble_grids(raw, n_yrs, len(prices), cm_payment, cm_derate)
     progress.progress(100, text='Done!')
     progress.empty()
 
@@ -396,6 +409,8 @@ if run:
         'year_label':  year_label,
         'n_yrs':       n_yrs,
         'grids':       grids,
+        'cm_payment':  cm_payment,
+        'cm_derate':   cm_derate,
         'price_info': (
             f'**{country} {year_label}** — {len(prices):,} hours  |  '
             f'Mean {ccy_sym}{prices.mean():.1f}/MWh  |  '
@@ -417,6 +432,8 @@ if ('cache_key' in st.session_state
     year_label  = st.session_state['year_label']
     n_yrs       = st.session_state['n_yrs']
     grids       = st.session_state['grids']
+    cm_payment  = st.session_state['cm_payment']
+    cm_derate   = st.session_state['cm_derate']
 
     st.info(st.session_state['price_info'])
 
@@ -436,6 +453,7 @@ if ('cache_key' in st.session_state
         cc        = float(np.dot(charge,    prices))
         dr        = float(np.dot(discharge, prices))
         net_rev   = (dr - cc) / n_yrs
+        cm_rev    = cm_payment * min(1.0, duration / cm_derate) if cm_payment > 0 else 0.0
         avg_dp    = dr / de if de > 0 else 0.0
         avg_cp    = cc / ce if ce > 0 else 0.0
         max_cyc   = tc['max_cycles']
@@ -445,7 +463,7 @@ if ('cache_key' in st.session_state
             'Duration (h)':                          duration,
             'RTE (%)':                               int(r['rte'] * 100),
             'Max cycles/yr cap':                     cyc_cap,
-            f'Net revenue ({ccy_sym}k/MW{ann})':    round(net_rev / 1000, 1),
+            f'Net revenue ({ccy_sym}k/MW{ann})':    round(net_rev / 1000 + cm_rev, 1),
             f'Discharge rev. ({ccy_sym}k/MW{ann})': round(dr / n_yrs / 1000, 1),
             f'Charge cost ({ccy_sym}k/MW{ann})':    round(cc / n_yrs / 1000, 1),
             f'Discharge h{ann}':                     round(np.sum(discharge > 1e-4) / n_yrs, 0),
