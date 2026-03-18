@@ -464,6 +464,7 @@ if ('cache_key' in st.session_state
             'RTE (%)':                               int(r['rte'] * 100),
             'Max cycles/yr cap':                     cyc_cap,
             f'Net revenue ({ccy_sym}k/MW{ann})':    round(net_rev / 1000 + cm_rev, 1),
+            f'  of which CM ({ccy_sym}k/MW{ann})':  round(cm_rev, 1) if cm_payment > 0 else '—',
             f'Discharge rev. ({ccy_sym}k/MW{ann})': round(dr / n_yrs / 1000, 1),
             f'Charge cost ({ccy_sym}k/MW{ann})':    round(cc / n_yrs / 1000, 1),
             f'Discharge h{ann}':                     round(np.sum(discharge > 1e-4) / n_yrs, 0),
