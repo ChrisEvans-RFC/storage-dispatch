@@ -17,6 +17,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from chart_export import FORMATS, PANELS, WORD_WIDTHS, render_time_charts
 from soc_lp_final import get_available_years, load_year_range, lp_dispatch, build_chart
 
 # ── constants ──────────────────────────────────────────────────────────────────
@@ -78,9 +79,31 @@ METRIC_COLORSCALE = {
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 
+def _market_regions(data_dir):
+    """Region names a market can offer — its per-country CSVs, newest listing.
+
+    all_countries.csv is the combined extract, not a selectable region.
+    """
+    if not os.path.isdir(data_dir):
+        return []
+    return sorted(os.path.splitext(f)[0] for f in os.listdir(data_dir)
+                  if f.endswith('.csv') and f != 'all_countries.csv')
+
+
 @st.cache_data(show_spinner=False)
 def cached_available_years(filepath):
     return get_available_years(filepath)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_export(_datetimes, _prices, _results, key, **opts) -> bytes:
+    """
+    Cached wrapper around render_time_charts. An expander body re-executes on
+    every rerun even while collapsed, so without this the figure would be
+    re-rendered each time any unrelated control is touched. Leading-underscore
+    arguments are excluded from the cache key; `key` carries the identity.
+    """
+    return render_time_charts(_datetimes, _prices, _results, **opts)
 
 
 def _dispatch_one(prices, dur, rte):
@@ -272,9 +295,12 @@ with st.sidebar:
     st.header('Settings')
 
     # ── Market / region selection ──────────────────────────────────────────────
-    available_markets = [m for m, (d, _, _) in DATA_SOURCES.items() if os.path.isdir(d)]
+    # A directory that exists but holds no usable CSV (e.g. ERCOT before its
+    # credentials are set up) would otherwise give an empty Region list and
+    # fail on countries[0] below, so require actual data to list the market.
+    available_markets = [m for m, (d, _, _) in DATA_SOURCES.items() if _market_regions(d)]
     if not available_markets:
-        st.error('No data directories found. Run download_data.py first.')
+        st.error('No price data found. Run download_data.py first.')
         st.stop()
 
     default_market = 'Europe (Day-Ahead)' if 'Europe (Day-Ahead)' in available_markets else available_markets[0]
@@ -282,8 +308,7 @@ with st.sidebar:
                                   index=available_markets.index(default_market))
     DATA_DIR, base_ccy, base_sym = DATA_SOURCES[market_label]
 
-    countries   = sorted([os.path.splitext(f)[0] for f in os.listdir(DATA_DIR)
-                          if f.endswith('.csv') and f != 'all_countries.csv'])
+    countries   = _market_regions(DATA_DIR)
     default_region = next((c for c in ('United Kingdom', 'ERCOT HB_NORTH', 'CAISO NP15',
                                         'New South Wales') if c in countries), countries[0])
     country     = st.selectbox('Region', countries,
@@ -343,11 +368,20 @@ with st.sidebar:
                                   value=rte_def, step=5, key=f'rte_{i}')
             max_cyc  = st.number_input('Max cycles/yr  (0 = unlimited)',
                                         min_value=0, value=cyc_def, step=50, key=f'cyc_{i}')
+            sf_col, rv_col = st.columns([1, 2])
+            start_full = sf_col.checkbox('Start full', value=False, key=f'sf_{i}',
+                                          help='Initialise SoC at full capacity (strategic reserve).')
+            readiness_v = rv_col.number_input(
+                f'Readiness ({ccy_sym}/MWh/h)', min_value=0.0, value=0.0,
+                step=0.5, format='%.2f', key=f'rv_{i}',
+                help='Insurance premium per MWh-hour below full capacity. '
+                     'Drives the battery to return to full even at an economic cost.')
             tech_config.append({'duration': int(duration), 'name': name,
-                                 'rte': rte_pct / 100, 'max_cycles': int(max_cyc)})
+                                 'rte': rte_pct / 100, 'max_cycles': int(max_cyc),
+                                 'start_full': start_full, 'readiness_value': float(readiness_v)})
 
     st.divider()
-    run = st.button('Run analysis', type='primary', use_container_width=True)
+    run = st.button('Run analysis', type='primary', width='stretch')
     n_grid = len(TS_DURATIONS) * len(TS_EFFICIENCIES)
     st.caption(f'{n_techs} SOC dispatch{"es" if n_techs > 1 else ""} + '
                f'{n_grid} sensitivity LP runs. Cached after first run.')
@@ -356,7 +390,8 @@ with st.sidebar:
 
 _cache_key = (
     market_label, country, tuple(selected_years), fx_rate,
-    tuple((t['duration'], t['rte'], t['max_cycles']) for t in tech_config),
+    tuple((t['duration'], t['rte'], t['max_cycles'],
+           t['start_full'], t['readiness_value']) for t in tech_config),
     len(TS_DURATIONS), len(TS_EFFICIENCIES),
     cm_payment, cm_derate,
 )
@@ -406,6 +441,7 @@ if run:
         'soc_results': soc_results,
         'tech_config': tech_config,
         'prices':      prices,
+        'datetimes':   datetimes,
         'year_label':  year_label,
         'n_yrs':       n_yrs,
         'grids':       grids,
@@ -429,6 +465,7 @@ if ('cache_key' in st.session_state
     soc_results = st.session_state['soc_results']
     tech_config = st.session_state['tech_config']
     prices      = st.session_state['prices']
+    datetimes   = st.session_state['datetimes']
     year_label  = st.session_state['year_label']
     n_yrs       = st.session_state['n_yrs']
     grids       = st.session_state['grids']
@@ -438,7 +475,7 @@ if ('cache_key' in st.session_state
     st.info(st.session_state['price_info'])
 
     # ── 1. SOC time history ────────────────────────────────────────────────────
-    st.plotly_chart(fig_soc, use_container_width=True)
+    st.plotly_chart(fig_soc, width='stretch')
 
     # ── 2. Performance summary table ───────────────────────────────────────────
     ann = ' (avg/yr)' if n_yrs > 1 else '/yr'
@@ -474,7 +511,7 @@ if ('cache_key' in st.session_state
             f'Avg chg. price ({ccy_sym}/MWh)':      round(avg_cp, 1),
             f'Spread ({ccy_sym}/MWh)':              round(avg_dp - avg_cp, 1),
         })
-    st.dataframe(pd.DataFrame(rows).set_index('Technology'), use_container_width=True)
+    st.dataframe(pd.DataFrame(rows).set_index('Technology'), width='stretch')
 
     # ── 3. Sensitivity ─────────────────────────────────────────────────────────
     st.subheader('Sensitivity — duration × efficiency space')
@@ -499,14 +536,89 @@ if ('cache_key' in st.session_state
     else:
         fig_ts = build_lines(grids, selected_tmpl, ccy_sym, year_label, country, log_x,
                              tech_markers=tech_markers)
-    st.plotly_chart(fig_ts, use_container_width=True)
+    st.plotly_chart(fig_ts, width='stretch')
 
     # ── 4. Downloads ───────────────────────────────────────────────────────────
     safe_label = year_label.replace('–', '-')
+    safe_ctry  = country.replace(' ', '_')
+
+    with st.expander('Download time charts for Word / reports', expanded=False):
+        st.caption(
+            'Rendered at a fixed physical size with point-sized text, so labels '
+            'stay readable when the image is placed in a document at its natural '
+            'width. Insert with **Insert → Pictures**; do not resize.'
+        )
+
+        ex1, ex2, ex3 = st.columns(3)
+        panel_label = ex1.selectbox('Panels', list(PANELS.keys()))
+        width_label = ex2.selectbox('Page width', list(WORD_WIDTHS.keys()))
+        fmt_label   = ex3.selectbox('Format', list(FORMATS.keys()))
+
+        dt_index = pd.to_datetime(datetimes)
+        d_min, d_max = dt_index[0].date(), dt_index[-1].date()
+
+        # A full year of hourly data compresses to an unreadable smear at 6.5in,
+        # so let the user pick the window that goes in the document.
+        rng1, rng2 = st.columns(2)
+        span = rng1.selectbox(
+            'Window',
+            ['Full period', 'First month', 'First week', 'Custom'],
+            help='Narrow the date range so individual cycles stay distinguishable.',
+        )
+        if span == 'Full period':
+            t0, t1 = d_min, d_max
+        elif span == 'First month':
+            t0, t1 = d_min, min(d_max, d_min + pd.Timedelta(days=30))
+        elif span == 'First week':
+            t0, t1 = d_min, min(d_max, d_min + pd.Timedelta(days=7))
+        else:
+            picked = rng2.date_input(
+                'Date range', value=(d_min, min(d_max, d_min + pd.Timedelta(days=14))),
+                min_value=d_min, max_value=d_max,
+            )
+            t0, t1 = picked if isinstance(picked, tuple) and len(picked) == 2 else (d_min, d_max)
+
+        ext, mime = FORMATS[fmt_label]
+        panel     = PANELS[panel_label]
+        width_in  = WORD_WIDTHS[width_label]
+
+        to_cap = panel != 'price' and st.checkbox(
+            'Scale SoC axis to nameplate capacity', value=False,
+            help='Off: the axis fits the charge actually reached, so short-duration '
+                 'traces stay legible alongside a long-duration one. On: the axis '
+                 'runs to the largest configured duration.',
+        )
+
+        t_from = pd.Timestamp(t0)
+        t_to   = pd.Timestamp(t1) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+
+        try:
+            img = _cached_export(
+                datetimes, prices, soc_results,
+                (_cache_key, panel, width_in, ext, to_cap, t_from, t_to,
+                 country, year_label, ccy_sym, n_yrs),
+                country=country, year_label=year_label, ccy=ccy_sym,
+                n_years=n_yrs, t0=t_from, t1=t_to,
+                panel=panel, width_in=width_in, fmt=ext,
+                axis_to_capacity=to_cap,
+            )
+        except ValueError as exc:
+            st.warning(str(exc))
+        else:
+            st.download_button(
+                label=f'Download {panel_label.lower()} — {fmt_label}',
+                data=img,
+                file_name=f'{panel}_{safe_ctry}_{safe_label}_{width_in}in.{ext}',
+                mime=mime,
+                type='primary',
+            )
+            if ext == 'png':
+                st.image(img, caption=f'Preview — {width_in} in wide at 300 dpi')
+
     st.download_button(
         label='Download SOC chart (HTML)',
         data=fig_soc.to_html(include_plotlyjs='cdn').encode(),
-        file_name=f'soc_{country.replace(" ","_")}_{safe_label}.html',
+        file_name=f'soc_{safe_ctry}_{safe_label}.html',
         mime='text/html',
     )
     with st.expander('Download sensitivity grid (CSV)'):

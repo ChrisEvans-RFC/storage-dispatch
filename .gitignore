@@ -19,3 +19,6 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
+
+# nemosis download cache (211 MB), regenerable
+aemo_wholesale_electricity_price_data_hourly/_nemosis_cache/

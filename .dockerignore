@@ -1,0 +1,28 @@
+# Keep the build context (and the image) to what the app actually needs.
+
+# 155 MB combined extract — app.py excludes it from the region list anyway
+european_wholesale_electricity_price_data_hourly/all_countries.csv
+
+# 211 MB of nemosis download cache, not read at runtime
+aemo_wholesale_electricity_price_data_hourly/_nemosis_cache/
+
+# ERCOT has no data yet; an empty market is hidden from the UI
+ercot_wholesale_electricity_price_data_hourly/
+
+# Local-only tooling and analysis scripts, not part of the served app
+download_data.py
+cm_storage_revenue_vs_duration.py
+lp_comparison.py
+storage_marginal_hour_model.py
+validate_soc.py
+
+.venv/
+.git/
+.github/
+.vscode/
+.claude/
+__pycache__/
+*.pyc
+*.html
+*.png
+*.json

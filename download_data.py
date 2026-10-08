@@ -15,11 +15,19 @@ Requirements:
   pip install nemosis pyarrow          # AEMO only
   (CAISO and ERCOT use only requests + pandas, already in requirements.txt)
 
+ERCOT credentials (free):
+  ERCOT blocks unauthenticated downloads. Register at https://developer.ercot.com,
+  subscribe to the "Public" product, create an app, then pass:
+    --ercot-user EMAIL --ercot-pass PASS --ercot-client-id ID --ercot-sub-key KEY
+  Or export as env vars: ERCOT_USER, ERCOT_PASS, ERCOT_CLIENT_ID, ERCOT_SUB_KEY
+
 Usage:
   python download_data.py                           # all markets, 2019-2024
   python download_data.py --market caiso
   python download_data.py --market aemo --start 2020 --end 2023
-  python download_data.py --market ercot --start 2022 --end 2024
+  python download_data.py --market ercot --start 2022 --end 2024 \
+    --ercot-user your@email.com --ercot-pass yourpass \
+    --ercot-client-id CLIENT_ID --ercot-sub-key SUB_KEY
 """
 
 import argparse
@@ -166,112 +174,154 @@ def download_caiso(start_year: int, end_year: int, out_dir: str):
         time.sleep(60)  # pause between nodes
 
 
-# ── ERCOT (public historical archive — no auth required) ─────────────────────
+# ── ERCOT (developer API — free account required) ─────────────────────────────
 #
-# ERCOT publishes yearly zipped CSVs of DAM Settlement Point Prices (NP4-190-CD)
-# at their public CDR archive. Each file covers one calendar year.
-# URL: https://www.ercot.com/files/docs/YYYY/NP4-190-CDYYYYMMDDYYYYMMDD.zip
-# Fallback: try the "Historical DAM Settlement Point Prices" bulk file.
+# ERCOT requires a free developer account for all data access (even public reports).
+# Direct file downloads from ercot.com/files/docs/ return 403.
+#
+# Setup (one-time, 5 minutes):
+#   1. Register at https://developer.ercot.com
+#   2. Subscribe to the "Public" product (free, under Products tab)
+#   3. Copy your Primary Subscription Key from your Profile page
+#   4. Create an Application (under My Apps) — note the Client ID shown
+#
+# Then run:
+#   python download_data.py --market ercot --start 2022 --end 2024 \
+#     --ercot-user your@email.com --ercot-pass yourpassword \
+#     --ercot-client-id YOUR_CLIENT_ID --ercot-sub-key YOUR_SUB_KEY
+#
+# Alternatively set environment variables to keep credentials out of shell history:
+#   ERCOT_USER, ERCOT_PASS, ERCOT_CLIENT_ID, ERCOT_SUB_KEY
 
-ERCOT_HUBS = ['HB_NORTH', 'HB_SOUTH', 'HB_WEST', 'HB_HOUSTON']
-
-
-def _ercot_year_urls(year: int):
-    """Return candidate URLs for ERCOT DAM SPP annual archive files."""
-    y = str(year)
-    return [
-        f'https://www.ercot.com/files/docs/{y}/NP4-190-CD_{y}0101_{y}1231.zip',
-        f'https://www.ercot.com/files/docs/{y}/Historical_DAM_Load_Zone_and_Hub_Prices.zip',
-        f'https://www.ercot.com/files/docs/{y}/Historical_DAM_Settlement_Point_Prices.zip',
-        f'https://www.ercot.com/files/docs/{y}/da_spp_{y}.zip',
-    ]
-
-
-def _ercot_fetch_year(year: int, session: requests.Session) -> pd.DataFrame | None:
-    """Try each candidate URL for a year; return raw DataFrame if found."""
-    for url in _ercot_year_urls(year):
-        try:
-            r = session.get(url, timeout=120)
-            if r.status_code == 404:
-                continue
-            r.raise_for_status()
-            with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
-                csv_name = next((n for n in zf.namelist()
-                                 if n.endswith('.csv') and not n.startswith('__')), None)
-                if csv_name is None:
-                    continue
-                df = pd.read_csv(zf.open(csv_name), low_memory=False)
-                print(f'      fetched from {url.split("/")[-1]}', flush=True)
-                return df
-        except (zipfile.BadZipFile, requests.HTTPError, Exception):
-            continue
-    return None
+ERCOT_HUBS      = ['HB_NORTH', 'HB_SOUTH', 'HB_WEST', 'HB_HOUSTON']
+ERCOT_TOKEN_URL = ('https://ercotb2c.b2clogin.com/ercotb2c.onmicrosoft.com/'
+                   'B2C_1_PUBAPI-ROPC-FLOW/oauth2/v2.0/token')
+ERCOT_API_BASE  = 'https://api.ercot.com/api/public-reports'
 
 
-def download_ercot(start_year: int, end_year: int, out_dir: str):
+def _ercot_get_token(username: str, password: str, client_id: str) -> str:
+    r = requests.post(ERCOT_TOKEN_URL, data={
+        'grant_type':    'password',
+        'username':      username,
+        'password':      password,
+        'response_type': 'token',
+        'scope':         f'openid {client_id}',
+        'client_id':     client_id,
+    }, timeout=30)
+    r.raise_for_status()
+    return r.json()['access_token']
+
+
+def _ercot_fetch_page(token: str, sub_key: str,
+                      date_from: str, date_to: str,
+                      hub: str, page: int = 1, size: int = 1000) -> dict:
+    r = requests.get(
+        f'{ERCOT_API_BASE}/np4-190-cd/',
+        headers={
+            'Authorization':             f'Bearer {token}',
+            'Ocp-Apim-Subscription-Key': sub_key,
+        },
+        params={
+            'deliveryDateFrom': date_from,
+            'deliveryDateTo':   date_to,
+            'settlementPoint':  hub,
+            'size':             size,
+            'page':             page,
+        },
+        timeout=60,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def _ercot_parse_response(resp: dict) -> pd.DataFrame | None:
     """
-    Download ERCOT historical DAM Settlement Point Prices from their public archive.
-
-    If this returns no data (ERCOT periodically restructures their archive URLs),
-    register for a free API key at https://developer.ercot.com and re-run with
-    the --ercot-key argument (to be implemented).
+    Parse ERCOT API v2 JSON into a flat DataFrame.
+    Handles both dict-per-row and columns+rows-as-arrays response formats.
     """
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'application/zip, application/octet-stream, */*',
-        'Referer': 'https://www.ercot.com/',
-    })
+    data = resp.get('data', [])
+    if not data:
+        return None
+    if isinstance(data[0], dict):
+        return pd.DataFrame(data)
+    fields = [f['label'] if isinstance(f, dict) else str(f)
+              for f in resp.get('fields', [])]
+    return pd.DataFrame(data, columns=fields)
 
-    # Collect all years into per-hub DataFrames
+
+def download_ercot(start_year: int, end_year: int, out_dir: str,
+                   username: str = '', password: str = '',
+                   client_id: str = '', sub_key: str = ''):
+    """
+    Download ERCOT DAM Settlement Point Prices (NP4-190-CD) via the developer API.
+    Credentials fall back to ERCOT_USER / ERCOT_PASS / ERCOT_CLIENT_ID / ERCOT_SUB_KEY
+    environment variables if not passed directly.
+    """
+    username  = username  or os.environ.get('ERCOT_USER', '')
+    password  = password  or os.environ.get('ERCOT_PASS', '')
+    client_id = client_id or os.environ.get('ERCOT_CLIENT_ID', '')
+    sub_key   = sub_key   or os.environ.get('ERCOT_SUB_KEY', '')
+
+    if not all([username, password, client_id, sub_key]):
+        print(
+            '  ERCOT credentials not provided. Register for a free account at\n'
+            '  https://developer.ercot.com, then run:\n'
+            '\n'
+            '    python download_data.py --market ercot \\\n'
+            '      --ercot-user YOUR_EMAIL --ercot-pass YOUR_PASSWORD \\\n'
+            '      --ercot-client-id YOUR_CLIENT_ID --ercot-sub-key YOUR_SUB_KEY\n'
+            '\n'
+            '  Or export env vars: ERCOT_USER, ERCOT_PASS, ERCOT_CLIENT_ID, ERCOT_SUB_KEY'
+        )
+        return
+
+    print('  Obtaining ERCOT API token...', end=' ', flush=True)
+    try:
+        token = _ercot_get_token(username, password, client_id)
+        print('OK')
+    except Exception as exc:
+        print(f'FAILED: {exc}')
+        return
+
     hub_chunks: dict[str, list] = {h: [] for h in ERCOT_HUBS}
 
     for year in range(start_year, end_year + 1):
-        print(f'    {year}...', end=' ', flush=True)
-        df = _ercot_fetch_year(year, session)
-        if df is None:
-            print('no data (URL not found)')
-            continue
-
-        # Normalise column names (ERCOT changes them between years)
-        df.columns = [c.strip().upper() for c in df.columns]
-
-        # Find the key columns by common name variants
-        col_map = {}
-        for col in df.columns:
-            cl = col.lower()
-            if 'settlement' in cl and 'point' in cl and 'price' in cl and 'type' not in cl:
-                col_map['price'] = col
-            elif 'delivery' in cl and 'date' in cl:
-                col_map['date'] = col
-            elif 'hour' in cl and 'end' in cl:
-                col_map['hour'] = col
-            elif col in ('SETTLEMENTPOINT', 'SETTLEMENT_POINT', 'SETTLEMENT POINT'):
-                col_map['node'] = col
-
-        if not all(k in col_map for k in ('price', 'date', 'hour', 'node')):
-            print(f'WARN: unrecognised columns: {list(df.columns)[:10]}')
-            continue
-
-        # Build datetime: hourEnding is 1-24, so subtract 1 for 0-based hour
-        df['Datetime (Local)'] = pd.to_datetime(
-            df[col_map['date']].astype(str) + ' ' +
-            (df[col_map['hour']].astype(float).astype(int) - 1).astype(str).str.zfill(2) + ':00',
-            format='%Y-%m-%d %H:%M', errors='coerce'
-        )
-        df['Datetime (UTC)'] = df['Datetime (Local)'] + pd.Timedelta(hours=6)  # CST
+        date_from = f'{year}-01-01'
+        date_to   = f'{year}-12-31'
 
         for hub in ERCOT_HUBS:
-            mask = df[col_map['node']].astype(str).str.strip() == hub
-            sub = df[mask][['Datetime (UTC)', 'Datetime (Local)', col_map['price']]].copy()
-            sub.columns = ['Datetime (UTC)', 'Datetime (Local)', 'Price (USD/MWh)']
-            if not sub.empty:
-                hub_chunks[hub].append(sub)
+            print(f'    {year} {hub}...', end=' ', flush=True)
+            page = 1
+            total = 0
 
-        rows_found = sum(len(df[df[col_map['node']].astype(str).str.strip() == h])
-                         for h in ERCOT_HUBS)
-        print(f'{rows_found:,} rows')
-        time.sleep(2)
+            while True:
+                try:
+                    resp = _ercot_fetch_page(token, sub_key, date_from, date_to,
+                                             hub, page)
+                except requests.HTTPError as exc:
+                    if exc.response.status_code == 401:
+                        token = _ercot_get_token(username, password, client_id)
+                        resp  = _ercot_fetch_page(token, sub_key, date_from, date_to,
+                                                  hub, page)
+                    else:
+                        print(f'HTTP {exc.response.status_code}')
+                        break
+
+                df_page = _ercot_parse_response(resp)
+                if df_page is None or df_page.empty:
+                    break
+
+                hub_chunks[hub].append(df_page)
+                total += len(df_page)
+
+                meta        = resp.get('_meta', {})
+                total_pages = meta.get('totalPages', page)
+                if page >= total_pages:
+                    break
+                page += 1
+                time.sleep(0.2)
+
+            print(f'{total:,} records')
 
     os.makedirs(out_dir, exist_ok=True)
     for hub in ERCOT_HUBS:
@@ -279,7 +329,36 @@ def download_ercot(start_year: int, end_year: int, out_dir: str):
         if not hub_chunks[hub]:
             print(f'  -> No data collected for {display_name}')
             continue
-        result = (pd.concat(hub_chunks[hub])
+
+        df = pd.concat(hub_chunks[hub], ignore_index=True)
+
+        # Map column names (ERCOT API uses camelCase)
+        col_map = {}
+        for col in df.columns:
+            cl = col.lower()
+            if 'price' in cl and 'settlement' in cl:
+                col_map['price'] = col
+            elif 'date' in cl and 'delivery' in cl:
+                col_map['date'] = col
+            elif 'hour' in cl and 'end' in cl:
+                col_map['hour'] = col
+
+        # hourEnding is "HH:00" or integer 1-24; convert to 0-based hour
+        hour_raw = df[col_map.get('hour', 'hourEnding')].astype(str)
+        hour_num = (pd.to_numeric(hour_raw.str.extract(r'(\d+)', expand=False),
+                                  errors='coerce').astype('Int64') - 1)
+        date_str = df[col_map.get('date', 'deliveryDate')].astype(str)
+
+        df['Datetime (Local)'] = pd.to_datetime(
+            date_str + ' ' + hour_num.astype(str).str.zfill(2) + ':00',
+            format='%Y-%m-%d %H:%M', errors='coerce',
+        )
+        df['Datetime (UTC)'] = df['Datetime (Local)'] + pd.Timedelta(hours=6)  # CST
+
+        price_col = col_map.get('price', 'settlementPointPrice')
+        df['Price (USD/MWh)'] = pd.to_numeric(df[price_col], errors='coerce')
+
+        result = (df[['Datetime (UTC)', 'Datetime (Local)', 'Price (USD/MWh)']]
                     .dropna(subset=['Datetime (UTC)'])
                     .sort_values('Datetime (UTC)')
                     .drop_duplicates('Datetime (UTC)')
@@ -357,6 +436,15 @@ def main():
     parser.add_argument('--start',  type=int, default=2019, help='First year (inclusive)')
     parser.add_argument('--end',    type=int, default=2024, help='Last year (inclusive)')
     parser.add_argument('--market', choices=['all', 'ercot', 'caiso', 'aemo'], default='all')
+    # ERCOT developer API credentials (free account at developer.ercot.com)
+    parser.add_argument('--ercot-user',      default='',
+                        help='ERCOT developer account email (or set ERCOT_USER env var)')
+    parser.add_argument('--ercot-pass',      default='',
+                        help='ERCOT developer account password (or set ERCOT_PASS env var)')
+    parser.add_argument('--ercot-client-id', default='',
+                        help='ERCOT API client ID from developer.ercot.com (or ERCOT_CLIENT_ID)')
+    parser.add_argument('--ercot-sub-key',   default='',
+                        help='ERCOT API subscription key (or set ERCOT_SUB_KEY env var)')
     args = parser.parse_args()
 
     if args.market in ('all', 'caiso'):
@@ -365,7 +453,9 @@ def main():
 
     if args.market in ('all', 'ercot'):
         print(f'\nDownloading ERCOT data {args.start}-{args.end}...')
-        download_ercot(args.start, args.end, 'ercot_wholesale_electricity_price_data_hourly')
+        download_ercot(args.start, args.end, 'ercot_wholesale_electricity_price_data_hourly',
+                       username=args.ercot_user, password=args.ercot_pass,
+                       client_id=args.ercot_client_id, sub_key=args.ercot_sub_key)
 
     if args.market in ('all', 'aemo'):
         print(f'\nDownloading AEMO data {args.start}-{args.end}...')

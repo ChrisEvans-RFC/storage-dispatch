@@ -43,7 +43,8 @@ PALETTE = [
 # LP DISPATCH
 # =============================================================================
 
-def lp_dispatch(prices, duration, rte=0.75, power_mw=1.0, max_cycles=0, n_years=1):
+def lp_dispatch(prices, duration, rte=0.75, power_mw=1.0, max_cycles=0, n_years=1,
+                readiness_value=0.0, start_full=False):
     """
     Optimal perfect-foresight dispatch via Linear Programme (HiGHS backend).
 
@@ -52,16 +53,20 @@ def lp_dispatch(prices, duration, rte=0.75, power_mw=1.0, max_cycles=0, n_years=
     Charging and discharging power are both capped at power_mw.
 
     Variables per hour t:  charge[t], discharge[t] in [0, power_mw]
-                           soc[t+1] in [0, capacity]   (soc[0]=0 fixed)
+                           soc[t+1] in [0, capacity]   (soc[0]=0 or capacity fixed)
     Equality:              soc[t+1] = soc[t] + charge[t]*rte - discharge[t]
     Inequality (optional): sum(discharge) ≤ max_cycles * n_years * capacity
     Objective:             maximise sum(discharge*price - charge*price)
+                                  + readiness_value * sum(soc[t])
+    readiness_value adds an insurance premium for time spent at high SoC, driving
+    the battery to return to full even when pure arbitrage would not justify it.
+    start_full initialises SoC at full capacity rather than zero.
     """
     n        = len(prices)
     capacity = power_mw * duration
     nv       = 3 * n   # charge(n) + discharge(n) + soc[1..n](n)
 
-    c_obj = np.concatenate([prices, -prices, np.zeros(n)])
+    c_obj = np.concatenate([prices, -prices, -readiness_value * np.ones(n)])
 
     # Sparse equality matrix: soc transition
     # soc[t+1] = soc[t] + charge[t]*rte - discharge[t]
@@ -70,7 +75,9 @@ def lp_dispatch(prices, duration, rte=0.75, power_mw=1.0, max_cycles=0, n_years=
     cols = np.concatenate([t, n + t, 2*n + t, 2*n + t[1:] - 1])
     vals = np.concatenate([-rte * np.ones(n), np.ones(n), np.ones(n), -np.ones(n - 1)])
     A_eq = csr_matrix((vals, (rows, cols)), shape=(n, nv))
-    b_eq = np.zeros(n)
+    # b_eq[0] encodes soc[0]: with soc[0]=0 it is 0; with start_full it is capacity
+    b_eq    = np.zeros(n)
+    b_eq[0] = float(capacity) if start_full else 0.0
 
     bounds = [(0, power_mw)] * n + [(0, power_mw)] * n + [(0, capacity)] * n
 
@@ -90,7 +97,8 @@ def lp_dispatch(prices, duration, rte=0.75, power_mw=1.0, max_cycles=0, n_years=
 
     charge    = res.x[:n]
     discharge = res.x[n:2*n]
-    soc       = np.concatenate([[0.0], res.x[2*n:]])   # soc[0..n]
+    soc0      = float(capacity) if start_full else 0.0
+    soc       = np.concatenate([[soc0], res.x[2*n:]])   # soc[0..n]
 
     revenue = float(np.dot(discharge, prices) - np.dot(charge, prices))
     return charge, discharge, soc[:n], revenue
@@ -181,10 +189,14 @@ def build_chart(datetimes, prices, year_label, country='Unknown',
 
     for tc in tech_config:
         d, rte, tech_name = tc['duration'], tc['rte'], tc['name']
-        max_cycles = tc.get('max_cycles', 0)
+        max_cycles      = tc.get('max_cycles', 0)
+        readiness_value = tc.get('readiness_value', 0.0)
+        start_full      = tc.get('start_full', False)
         print(f"  LP {d}h ({tech_name} {rte*100:.0f}% RTE)...", end=' ', flush=True)
-        charge, discharge, soc, revenue = lp_dispatch(prices, d, rte=rte,
-                                                       max_cycles=max_cycles, n_years=n_years)
+        charge, discharge, soc, revenue = lp_dispatch(
+            prices, d, rte=rte, max_cycles=max_cycles, n_years=n_years,
+            readiness_value=readiness_value, start_full=start_full,
+        )
         rev_ann = revenue / n_years
         print(f"{ccy}{rev_ann/1000:.1f}k/MW/yr  "
               f"({int(np.sum(discharge > 1e-4) / n_years)} discharge h/yr)")

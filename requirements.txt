@@ -1,8 +1,14 @@
-streamlit>=1.32
-numpy
-pandas
-scipy
-plotly
+# Pinned to the versions the app is actually verified against locally.
+# Note: pandas 3.x and plotly 7.x are current on PyPI but are untested majors
+# for this app — bump deliberately and re-run the app, don't float.
+streamlit==1.55.0
+numpy==2.4.3
+pandas==2.3.3
+scipy==1.17.1
+plotly==6.6.0
+
+# Word/report image export (chart_export.py):
+matplotlib==3.11.2
 
 # Optional — only needed to run download_data.py:
 # gridstatus   # ERCOT and CAISO historical prices
